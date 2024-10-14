@@ -1,9 +1,12 @@
-import { CameraOutlined, QrcodeOutlined } from "@ant-design/icons";
+import { CameraOutlined, QrcodeOutlined, SnippetsOutlined } from "@ant-design/icons";
 import { Badge, Input, message, Spin } from "antd";
 import { useLookupAddress } from "eth-hooks";
-import React, { useCallback, useState } from "react";
-import QrReader from "react-qr-reader";
+import React, { useCallback, useState, useEffect } from "react";
+import QrReader from "react-qr-reader-es6";
 import { QRPunkBlockie } from ".";
+
+import { isValidIban } from "../helpers/MoneriumHelper";
+import { parseEIP618 } from "../helpers/EIP618Helper";
 
 // probably we need to change value={toAddress} to address={toAddress}
 
@@ -19,7 +22,7 @@ import { QRPunkBlockie } from ".";
     ensProvider={mainnetProvider}
     placeholder="Enter address"
     value={toAddress}
-    onChange={setToAddress}
+    setToAddress={setToAddress}
   />
 
   ~ Features ~
@@ -28,16 +31,83 @@ import { QRPunkBlockie } from ".";
               (ex. "0xa870" => "user.eth") or you can enter directly ENS name instead of address
   - Provide placeholder="Enter address" value for the input
   - Value of the address input is stored in value={toAddress}
-  - Control input change by onChange={setToAddress}
-                          or onChange={address => { setToAddress(address);}}
 */
 
+const PasteButton = ({ stateSetter }) => {
+  return (
+    <div
+      style={{ marginTop: 4, cursor: "pointer" }}
+      onClick={async () => {
+        try {
+          const text = await navigator.clipboard.readText();
+          stateSetter(text);
+        } catch (err) {
+          console.error("Failed to read clipboard:", err);
+        }
+      }}
+    >
+      <Badge>
+        <SnippetsOutlined style={{ color: "#000000", fontSize: 18 }} />
+      </Badge>{" "}
+      Paste
+    </div>
+  );
+};
+
 export default function AddressInput(props) {
+  const {
+    ensProvider,
+    setAmount,
+    setToAddress,
+    ibanAddressObject,
+    setIbanAddressObject,
+    isMoneriumTransferReady,
+    setTargetNetwork,
+    networkSettingsHelper,
+  } = props;
+
   const [value, setValue] = useState(props.address);
+
   const [scan, setScan] = useState(false);
 
+  const [isIbanAddress, setIsIbanAddress] = useState(false);
+
+  const [ibanFirstName, setIbanFirstName] = useState("");
+  const [ibanLastName, setIbanLastName] = useState("");
+
+  const [ibanMemo, setIbanMemo] = useState("");
+
   const currentValue = typeof props.value !== "undefined" ? props.value : value;
+
   const ens = useLookupAddress(props.ensProvider, currentValue);
+
+  useEffect(() => {
+    if (!isMoneriumTransferReady) {
+      return;
+    }
+
+    const iban = ens || currentValue;
+
+    if (isValidIban(iban)) {
+      setIsIbanAddress(true);
+
+      setIbanAddressObject({
+        ...ibanAddressObject,
+        iban,
+      });
+    } else {
+      setIsIbanAddress(false);
+    }
+  }, [ens, currentValue, value, isMoneriumTransferReady]);
+
+  useEffect(() => {
+    setIbanAddressObject({
+      ...ibanAddressObject,
+      firstName: ibanFirstName,
+      lastName: ibanLastName,
+      memo: ibanMemo,
+    });
+  }, [ibanFirstName, ibanLastName, ibanMemo]);
 
   const scannerButton = (
     <div
@@ -53,14 +123,60 @@ export default function AddressInput(props) {
     </div>
   );
 
-  const { ensProvider, onChange } = props;
   const updateAddress = useCallback(
     async newValue => {
       if (typeof newValue !== "undefined") {
+        console.log("SCAN", newValue);
 
-        console.log("SCAN",newValue)
+        try {
+          // EPC QR code
+          if (newValue.includes("BCD") && newValue.includes("SCT")) {
+            const elements = newValue.split("\n");
 
-        /*console.log("🔑 Incoming Private Key...");
+            const name = elements[5];
+            const names = name.split(" ");
+            const firstName = names[0];
+            const lastName = names[1];
+
+            const iban = elements[6];
+
+            let amount;
+            const amountData = elements[7];
+
+            if (amountData) {
+              try {
+                amount = parseFloat(amountData.replace("EUR", ""));
+              } catch (error) {
+                console.log("Couldn't parse amount", error);
+              }
+            }
+
+            const memo = elements[10];
+
+            setIbanAddressObject({
+              firstName: name,
+              iban,
+            });
+
+            setIbanFirstName(firstName);
+            setIbanLastName(lastName);
+            setToAddress(iban);
+
+            if (amount) {
+              setAmount(amount);
+            }
+
+            if (memo) {
+              setIbanMemo(memo);
+            }
+
+            return;
+          }
+        } catch (error) {
+          console.log("Couldn't parse EPC QR", error);
+        }
+
+        /* console.log("🔑 Incoming Private Key...");
         rawPK = incomingPK;
         burnerConfig.privateKey = rawPK;
         window.history.pushState({}, "", "/");
@@ -68,10 +184,10 @@ export default function AddressInput(props) {
         if (currentPrivateKey && currentPrivateKey !== rawPK) {
           window.localStorage.setItem("metaPrivateKey_backup" + Date.now(), currentPrivateKey);
         }
-        window.localStorage.setItem("metaPrivateKey", rawPK);*/
-        if(newValue && newValue.indexOf && newValue.indexOf("wc:")===0){
-          props.walletConnect(newValue)
-        }else{
+        window.localStorage.setItem("metaPrivateKey", rawPK); */
+        if (newValue && newValue.indexOf && newValue.indexOf("wc:") === 0) {
+          props.walletConnect(newValue);
+        } else {
           let address = newValue;
           setValue(address);
           if (address.indexOf(".eth") > 0 || address.indexOf(".xyz") > 0) {
@@ -84,13 +200,11 @@ export default function AddressInput(props) {
             } catch (e) {}
           }
           setValue(address);
-          if (typeof onChange === "function") {
-            onChange(address);
-          }
+          setToAddress(address);
         }
       }
     },
-    [ensProvider, onChange],
+    [ensProvider, setToAddress],
   );
 
   const scanner = scan ? (
@@ -122,37 +236,48 @@ export default function AddressInput(props) {
         }}
         onScan={newValue => {
           if (newValue) {
-            console.log("SCAN VALUE",newValue);
+            console.log("SCAN VALUE", newValue);
 
-            if(newValue && newValue.length==66 && newValue.indexOf("0x")===0){
-              console.log("This might be a PK...",newValue)
-              setTimeout(()=>{
-                console.log("opening...")
-                let a = document.createElement("a");
+            if (newValue && newValue.length === 66 && newValue.indexOf("0x") === 0) {
+              console.log("This might be a PK...", newValue);
+              setTimeout(() => {
+                console.log("opening...");
+                const a = document.createElement("a");
                 document.body.appendChild(a);
                 a.style = "display: none";
-                a.href = "https://punkwallet.io/pk#"+newValue;
+                a.href = "https://punkwallet.io/pk#" + newValue;
                 a.click();
                 document.body.removeChild(a);
-              },250)
+              }, 250);
               setScan(false);
               updateAddress();
-            }else if(newValue && newValue.indexOf && newValue.indexOf("http")===0){
-              console.log("this is a link, following...")
-              setTimeout(()=>{
-                console.log("opening...")
-                let a = document.createElement("a");
+            } else if (newValue && newValue.indexOf && newValue.indexOf("http") === 0) {
+              console.log("this is a link, following...");
+              setTimeout(() => {
+                console.log("opening...");
+                const a = document.createElement("a");
                 document.body.appendChild(a);
                 a.style = "display: none";
                 a.href = newValue;
                 a.click();
                 document.body.removeChild(a);
-              },250)
+              }, 250);
 
               setScan(false);
               updateAddress();
-            }else{
+            } else {
               let possibleNewValue = newValue;
+
+              try {
+                if (possibleNewValue.startsWith("ethereum:")) {
+                  parseEIP618(possibleNewValue, networkSettingsHelper, setTargetNetwork, setToAddress, setAmount);
+                  setScan(false);
+                  return;
+                }
+              } catch (error) {
+                console.log("Coudn't parse EIP681", error);
+              }
+
               possibleNewValue = possibleNewValue.replace("ethereum:", "");
               possibleNewValue = possibleNewValue.replace("eth:", "");
               console.log("possibleNewValue",possibleNewValue)
@@ -163,7 +288,6 @@ export default function AddressInput(props) {
               setScan(false);
               updateAddress(possibleNewValue);
             }
-
           }
         }}
         style={{ width: "100%" }}
@@ -173,20 +297,13 @@ export default function AddressInput(props) {
     ""
   );
 
-  const punkSize = 45;
-
-  const part1 = currentValue && currentValue.substr && currentValue.substr(2, 20);
-  const part2 = currentValue && currentValue.substr && currentValue.substr(22);
-  const x = parseInt(part1, 16) % 100;
-  const y = parseInt(part2, 16) % 100;
-
   props.hoistScanner(() => {
     setScan(!scan);
   });
 
   return (
-    <div>
-      <div style={{ position: "absolute", left: -202, top: -88 }}>
+    <div style={{ position: "relative" }}>
+      <div style={{ position: "absolute", left: -212, top: 16 }}>
         {currentValue && currentValue.length > 41 ? <QRPunkBlockie scale={0.6} address={currentValue} /> : ""}
       </div>
 
@@ -205,6 +322,44 @@ export default function AddressInput(props) {
           updateAddress(e.target.value);
         }}
       />
+
+      {isIbanAddress && (
+        <div style={{ display: "flex", flexDirection: "column" }}>
+          <div style={{ padding: 10 }}>
+            <Input
+              addonAfter={<PasteButton stateSetter={setIbanFirstName} />}
+              id="firstName"
+              onChange={e => {
+                setIbanFirstName(e.target.value);
+              }}
+              placeholder="First Name"
+              value={ibanFirstName}
+            />
+          </div>
+          <div style={{ padding: 10 }}>
+            <Input
+              addonAfter={<PasteButton stateSetter={setIbanLastName} />}
+              id="lastName"
+              onChange={e => {
+                setIbanLastName(e.target.value);
+              }}
+              placeholder="Last Name"
+              value={ibanLastName}
+            />
+          </div>
+          <div style={{ padding: 10 }}>
+            <Input
+              addonAfter={<PasteButton stateSetter={setIbanMemo} />}
+              id="memo"
+              onChange={e => {
+                setIbanMemo(e.target.value);
+              }}
+              placeholder="Reference / Memo"
+              value={ibanMemo}
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

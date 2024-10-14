@@ -3,11 +3,10 @@ import { Button, Popover } from "antd";
 import React, { useEffect, useState } from "react";
 
 import { TransactionManager } from "../helpers/TransactionManager";
-import { QRPunkBlockie } from "./";
+
+import { TransactionDisplay } from "./";
 
 import axios from "axios";
-
-import moment from 'moment';
 
 const { BigNumber, ethers } = require("ethers");
 
@@ -16,6 +15,8 @@ export default function TransactionResponseDisplay({transactionResponse, transac
   const [loadingSpeedUp, setLoadingSpeedUp] = useState(false);
   const [loadingCancel, setLoadingCancel] = useState(false);
   const [estimatedConfirmationSeconds, setEstimatedConfirmationSeconds] = useState(0);
+
+  const erc20 = transactionResponse?.erc20;
 
   const updateConfirmations = async () => {
     if (transactionResponse.confirmations > 0) {
@@ -39,11 +40,15 @@ export default function TransactionResponseDisplay({transactionResponse, transac
   useEffect(() => {
     updateConfirmations();
 
+    // Skip estimation, transactions are confirmed on mainnet quickly, in the next 1 or two blocks.
+    // https://github.com/ethers-io/ethers.js/issues/2828#issuecomment-1283014250
+    /*
     if ((transactionResponse.confirmations > 0) || (transactionResponse?.chainId != NETWORKS.ethereum.chainId)) {
       return;
     }
 
     getConfirmationEstimation(transactionResponse.gasPrice);
+    */
   },[transactionResponse, transactionManager]);
 
   useEffect(() => {
@@ -60,7 +65,7 @@ export default function TransactionResponseDisplay({transactionResponse, transac
   const getTransactionPopoverContent = () => {
     return (
       <div style={{ margin: "1em"}}>
-        {isCancelTransaction(transactionResponse) && <p style={{ marginBottom: "2em"}}><b>The original transaciton was replaced by a cancel transaction - sending 0 to yourself</b></p>}
+        {isCancelTransaction(transactionResponse) && <p style={{ marginBottom: "2em"}}><b>The original transaction was replaced by a cancel transaction - sending 0 to yourself</b></p>}
         <p><b>From:</b> {transactionResponse.from}</p>
         <p><b>To:</b> {transactionResponse.to}</p>
         <p><b>Value:</b> {ethers.utils.formatEther(BigNumber.from(transactionResponse.value).toString())} Ξ</p>
@@ -84,7 +89,6 @@ export default function TransactionResponseDisplay({transactionResponse, transac
       setLoadingSpeedUp(true);
     }
     
-
     let newTransactionResponse;
     try {
       if (cancelTransaction) {
@@ -95,6 +99,16 @@ export default function TransactionResponseDisplay({transactionResponse, transac
       }
 
       transactionManager.log("handleSpeedUp", newTransactionResponse, transactionResponse.hash);  
+
+      // Sleep a little bit, the previous tx might have been confirmed in the meantime
+      await new Promise(r => setTimeout(r, 6000));
+
+      let confirmations = await transactionManager.getConfirmations(transactionResponse);
+
+      if (confirmations > 0) {
+        console.log("Previous tx has been confirmed");
+        newTransactionResponse = undefined;
+      }
     }
     catch(error){
       transactionManager.log("speedUpTransaction failed, previous transactionHash was probably comfirmed in the meantime", transactionResponse.hash, error);
@@ -108,6 +122,10 @@ export default function TransactionResponseDisplay({transactionResponse, transac
     }
 
     if (newTransactionResponse) {
+      if (erc20) {
+        newTransactionResponse.erc20 = erc20;
+      }
+      
       transactionManager.setTransactionResponse(newTransactionResponse);  
     }
     else {
@@ -164,26 +182,29 @@ export default function TransactionResponseDisplay({transactionResponse, transac
 
   return  (
     <div style={{ padding: 16 }}>
-      {(transactionResponse.hash && (transactionResponse.nonce || transactionResponse?.nonce == 0)) && <a style={{ color:'rgb(24, 144, 255)' }} href={blockExplorer + "tx/" + transactionResponse.hash}>{transactionResponse.nonce}</a>}
       {!isCancelTransaction(transactionResponse) ?
-        <>
-          <div style={{ position:"relative",left:-120, top:-30 }}>
-            <QRPunkBlockie scale={0.4} address={transactionResponse.to} />
-         </div>
-
-        
-
-        
-        {(transactionResponse.value) && <p><b>Value:</b> {ethers.utils.formatEther(BigNumber.from(transactionResponse.value).toString())} Ξ</p>}
-        
-        </>
-
+          <TransactionDisplay 
+            toAddress={erc20?.to ? erc20.to : transactionResponse.to}
+            txHash={transactionResponse?.hash}
+            txDisplayName={transactionResponse?.origin ? "Gasless tx " + transactionResponse?.nonce : transactionResponse?.nonce}
+            erc20TokenName={erc20?.token?.name}
+            erc20ImgSrc={erc20?.token?.imgSrc}
+            amount={erc20?.amount ? erc20.amount : transactionResponse?.value}
+            blockExplorer={blockExplorer}
+            date={transactionResponse?.date}
+            showClearButton={transactionResponse.confirmations != 0}
+            clearButtonAction={
+              () => {
+                transactionManager.removeTransactionResponse(transactionResponse);
+              }
+            }
+            chainId = {transactionResponse.chainId}
+          />
         :
-        <p>
-          Transaction cancelled
-        </p>
+          <p>
+            Transaction cancelled
+          </p>
       }
-      {transactionResponse.date && <p> {moment(transactionResponse.date).fromNow()}</p>}
 
       {(confirmations == 0) &&    
         <div>        
@@ -191,7 +212,7 @@ export default function TransactionResponseDisplay({transactionResponse, transac
             <Popover placement="right" content={getTransactionPopoverContent()} trigger="click">
               <Button style={{ padding: 0 }}type="link" >Transaction</Button>
             </Popover>
-            <b> {transactionResponse.nonce} </b> is pending, <b> gasPrice: {getGasPriceGwei()} </b>            
+            <b> {transactionResponse.nonce} </b> is pending, <b> {transactionResponse.gasPrice ? "gasPrice:" : "priorityFee:"} {getGasPriceGwei()} </b>            
           </div>
 
           <div>
@@ -207,7 +228,7 @@ export default function TransactionResponseDisplay({transactionResponse, transac
               size="large"
               shape="round"
               loading={loadingCancel}
-              disabled={loadingSpeedUp || loadingCancel}
+              disabled={loadingSpeedUp || loadingCancel || transactionResponse.origin}
              >
               Cancel
              </Button>
@@ -221,26 +242,14 @@ export default function TransactionResponseDisplay({transactionResponse, transac
               size="large"
               shape="round"
               loading={loadingSpeedUp}
-              disabled={loadingSpeedUp || loadingCancel}
+              disabled={loadingSpeedUp || loadingCancel || transactionResponse.origin}
              >
               {!isCancelTransaction(transactionResponse) ? <> Speed Up 10% </> : <> Speed Up This Cancellation 10% </>}
              </Button>
           </div>
         </div>
-        
-        
      }
 
-     {
-      (transactionResponse.confirmations != 0) && <Button
-       onClick={
-        () => {
-          transactionManager.removeTransactionResponse(transactionResponse);
-        }}
-       >
-       Clear  🗑
-       </Button>
-     }
     </div>
   );
 }

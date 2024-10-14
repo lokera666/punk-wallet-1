@@ -1,8 +1,8 @@
-import { CaretUpOutlined, ScanOutlined, SendOutlined, ReloadOutlined } from "@ant-design/icons";
-import { JsonRpcProvider, StaticJsonRpcProvider, Web3Provider } from "@ethersproject/providers";
+import { CaretUpOutlined, ScanOutlined, SendOutlined } from "@ant-design/icons";
+import { StaticJsonRpcProvider, Web3Provider } from "@ethersproject/providers";
 import { formatEther, parseEther } from "@ethersproject/units";
 import WalletConnectProvider from "@walletconnect/web3-provider";
-import { Alert, Button, Col, Row, Select, Spin, Input, Modal, notification } from "antd";
+import { Alert, Button, Col, Row, Spin, Switch, Input, Modal } from "antd";
 import "antd/dist/antd.css";
 import { useUserAddress } from "eth-hooks";
 import React, { useCallback, useEffect, useState, useMemo } from "react";
@@ -13,27 +13,82 @@ import {
   Address,
   AddressInput,
   Balance,
+  ERC20Balance,
+  ERC20Input,
+  SelectorWithSettings,
   EtherInput,
   Faucet,
   GasGauge,
   Header,
+  IFrame,
+  Monerium,
+  MoneriumCrossChainAddressSelector,
+  MoneriumOnChainCrossChainRadio,
+  NetworkDisplay,
+  NetworkDetailedDisplay,
+  SettingsModal,
   QRPunkBlockie,
   Ramp,
+  Reload,
+  TokenDetailedDisplay,
+  TokenDisplay,
+  TokenImportDisplay,
   TransactionResponses,
   Wallet,
-  WalletConnectTransactionDisplay,
+  WalletConnectActiveSessions,
+  WalletConnectTransactionPopUp,
+  WalletConnectV2ConnectionError,
 } from "./components";
-import { INFURA_ID, NETWORK, NETWORKS } from "./constants";
+import showModal from "./components/GenericModal";
+import { INFURA_ID, NETWORK, NETWORKS, ERROR_MESSAGES } from "./constants";
 import { Transactor } from "./helpers";
-import { useBalance, useExchangePrice, useGasPrice, useLocalStorage, usePoller, useUserProvider } from "./hooks";
+import { parseEIP618 } from "./helpers/EIP618Helper";
+import { useBalance, useExchangePrice, useGasPrice, useLocalStorage, useUserProvider } from "./hooks";
 
-import WalletConnect from "@walletconnect/client";
+import {
+  createWeb3wallet,
+  onSessionProposal,
+} from "./helpers/WalletConnectV2Helper";
 
-import { TransactionManager } from "./helpers/TransactionManager";
+import {
+  ON_CHAIN_IBAN_VALUE,
+  getAvailableTargetChainNames,
+  isCrossChain,
+  getMemo,
+  getNewMoneriumClient,
+  getFilteredOrders,
+  getShortAddress,
+  isValidIban,
+  placeCrossChainOrder,
+  placeIbanOrder,
+  isIbanAddressObjectValid,
+} from "./helpers/MoneriumHelper";
+
+import { SettingsHelper } from "./helpers/SettingsHelper";
+
+import { monitorBalance } from "./helpers/ERC20Helper";
+
+import {
+  NETWORK_SETTINGS_STORAGE_KEY,
+  migrateSelectedNetworkStorageSetting,
+  getNetworkWithSettings,
+} from "./helpers/NetworkSettingsHelper";
+
+import {
+  TOKEN_SETTINGS_STORAGE_KEY,
+  getSelectedErc20Token,
+  getTokens,
+  migrateSelectedTokenStorageSetting,
+} from "./helpers/TokenSettingsHelper";
+
+const { TOKEN_ERROR } = ERROR_MESSAGES;
 
 const { confirm } = Modal;
 
-const { ethers } = require("ethers");
+const { ethers, BigNumber } = require("ethers");
+
+const { OrderState } = require("@monerium/sdk");
+
 /*
     Welcome to 🏗 scaffold-eth !
 
@@ -53,37 +108,6 @@ const { ethers } = require("ethers");
     (and then use the `useExternalContractLoader()` hook!)
 */
 
-/// 📡 What chain are your contracts deployed to?
-const cachedNetwork = window.localStorage.getItem("network");
-let targetNetwork = NETWORKS[cachedNetwork || "ethereum"]; // <------- select your target frontend network (localhost, rinkeby, xdai, mainnet)
-if (!targetNetwork) {
-  targetNetwork = NETWORKS["ethereum"];
-}
-// 😬 Sorry for all the console logging
-const DEBUG = false;
-
-// 🛰 providers
-if (DEBUG) console.log("📡 Connecting to Mainnet Ethereum");
-// const mainnetProvider = getDefaultProvider("mainnet", { infura: INFURA_ID, etherscan: ETHERSCAN_KEY, quorum: 1 });
-// const mainnetProvider = new InfuraProvider("mainnet",INFURA_ID);
-//
-// attempt to connect to our own scaffold eth rpc and if that fails fall back to infura...
-// Using StaticJsonRpcProvider as the chainId won't change see https://github.com/ethers-io/ethers.js/issues/901
-const scaffoldEthProvider = new StaticJsonRpcProvider("https://rpc.scaffoldeth.io:48544");
-//const mainnetInfura = new StaticJsonRpcProvider("https://mainnet.infura.io/v3/" + INFURA_ID);
-// ( ⚠️ Getting "failed to meet quorum" errors? Check your INFURA_I
-
-// 🏠 Your local provider is usually pointed at your local blockchain
-const localProviderUrl = targetNetwork.rpcUrl;
-// as you deploy to other networks you can set REACT_APP_PROVIDER=https://dai.poa.network in packages/react-app/.env
-const localProviderUrlFromEnv = process.env.REACT_APP_PROVIDER ? process.env.REACT_APP_PROVIDER : localProviderUrl;
-if (DEBUG) console.log("🏠 Connecting to provider:", localProviderUrlFromEnv);
-let localProvider = new StaticJsonRpcProvider(localProviderUrlFromEnv);
-
-
-// 🔭 block explorer URL
-const blockExplorer = targetNetwork.blockExplorer;
-
 let scanner;
 
 /*
@@ -101,104 +125,102 @@ const web3Modal = new Web3Modal({
           10: "https://mainnet.optimism.io", // xDai
           100: "https://rpc.gnosischain.com", // xDai
           137: "https://polygon-rpc.com",
+          280: "https://zksync2-testnet.zksync.dev", // zksync alpha tesnet
           31337: "http://localhost:8545",
           42161: "https://arb1.arbitrum.io/rpc",
-          80001: "https://rpc-mumbai.maticvigil.com"
+          80001: "https://rpc-mumbai.maticvigil.com",
+          80216: "https://chain.buidlguidl.com:8545",
         },
       },
     },
   },
 });
 
+// 😬 Sorry for all the console logging
+const DEBUG = false;
+
+const networks = Object.values(NETWORKS);
 
 function App(props) {
+  const [dollarMode, setDollarMode] = useLocalStorage("dollarMode", true);
 
-  //const [isWalletModalVisible, setIsWalletModalVisible] = useState(false);
-  //const [walletModalData, setWalletModalData] = useState();
+  const [networkSettingsModalOpen, setNetworkSettingsModalOpen] = useState(false);
+  const [networkSettings, setNetworkSettings] = useLocalStorage(NETWORK_SETTINGS_STORAGE_KEY, {});
+  const networkSettingsHelper = new SettingsHelper(
+    NETWORK_SETTINGS_STORAGE_KEY,
+    networks,
+    networkSettings,
+    setNetworkSettings,
+    getNetworkWithSettings,
+  );
 
-  //
-  // TRYING SOMETHING HERE...
-  // the "noNetwork" error is really annoying because the network selection gets locked up
-  //   if you select a bad network, let's have it revert back to ethereum
-  //
-  /*useEffect(()=>{
-    const waitForNetwork = async ()=>{
-      localProvider._networkPromise.catch((e)=>{
-        if(e.event=="noNetwork"){
-          window.localStorage.setItem("network", "ethereum");
-          setTimeout(() => {
-            window.location.reload();
-          }, 1);
-        }
-      })
+  const [targetNetwork, setTargetNetwork] = useState(() => networkSettingsHelper.getSelectedItem(true));
+
+  const [mainnetProvider] = useState(() => new StaticJsonRpcProvider(NETWORKS.ethereum.rpcUrl));
+  const [localProvider, setLocalProvider] = useState(() => new StaticJsonRpcProvider(targetNetwork.rpcUrl));
+  useEffect(() => {
+    setLocalProvider(prevProvider =>
+      localProvider?.connection?.url == targetNetwork.rpcUrl
+        ? prevProvider
+        : new StaticJsonRpcProvider(targetNetwork.rpcUrl),
+    );
+  }, [targetNetwork]);
+
+  // 🔭 block explorer URL
+  const blockExplorer = targetNetwork.blockExplorer;
+
+  const networkName = targetNetwork.name;
+  const erc20Tokens = targetNetwork?.erc20Tokens;
+
+  const tokenSettingsStorageKey = networkName + TOKEN_SETTINGS_STORAGE_KEY;
+  const tokens = getTokens(targetNetwork?.nativeToken, erc20Tokens);
+  const [tokenSettingsModalOpen, setTokenSettingsModalOpen] = useState(false);
+  const [tokenSettings, setTokenSettings] = useLocalStorage(tokenSettingsStorageKey, {});
+
+  const tokenSettingsHelper = tokens
+    ? new SettingsHelper(tokenSettingsStorageKey, tokens, tokenSettings, setTokenSettings)
+    : undefined;
+
+  useEffect(() => {
+    migrateSelectedTokenStorageSetting(networkName, tokenSettingsHelper);
+    migrateSelectedNetworkStorageSetting(networkSettingsHelper);
+  }, []);
+
+  const selectedErc20Token = tokenSettingsHelper
+    ? getSelectedErc20Token(
+        tokenSettingsHelper.getSelectedItem(),
+        erc20Tokens.concat(tokenSettingsHelper.getCustomItems()),
+      )
+    : undefined;
+
+  const switchToEth = localStorage.getItem("switchToEth");
+
+  if (switchToEth) {
+    if (targetNetwork?.nativeToken?.name) {
+      tokenSettingsHelper.updateSelectedName(targetNetwork.nativeToken.name);
+      console.log("Switched to native token");
     }
-    waitForNetwork()
-  },[ localProvider ])*/
 
-  const [checkingBalances, setCheckingBalances] = useState();
-  // a function to check your balance on every network and switch networks if found...
-  const checkBalances = async address => {
-    if(!checkingBalances){
-      setCheckingBalances(true)
-      setTimeout(()=>{
-        setCheckingBalances(false)
-      },5000)
-      //getting current balance
-      const currentBalance = await localProvider.getBalance(address);
-      if(currentBalance && ethers.utils.formatEther(currentBalance)=="0.0"){
-        console.log("No balance found... searching...")
-        for (const n in NETWORKS) {
-          try{
-            const tempProvider = new JsonRpcProvider(NETWORKS[n].rpcUrl);
-            const tempBalance = await tempProvider.getBalance(address);
-            const result = tempBalance && formatEther(tempBalance);
-            if (result != 0) {
-              console.log("Found a balance in ", n);
-              window.localStorage.setItem("network", n);
-              setTimeout(() => {
-                window.location.reload(true);
-              }, 500);
-            }
-          }catch(e){console.log(e)}
-        }
-      }else{
-        window.location.reload(true);
-      }
-    }
-
-
-  };
-
-  const mainnetProvider = scaffoldEthProvider //scaffoldEthProvider && scaffoldEthProvider._network ?  : mainnetInfura;
+    localStorage.removeItem("switchToEth");
+  }
 
   const [injectedProvider, setInjectedProvider] = useState();
 
   const logoutOfWeb3Modal = async () => {
     await web3Modal.clearCachedProvider();
-    if(injectedProvider && injectedProvider.provider && injectedProvider.provider.disconnect){
+    if (injectedProvider && injectedProvider.provider && injectedProvider.provider.disconnect) {
       await injectedProvider.provider.disconnect();
     }
     setTimeout(() => {
       window.location.reload();
     }, 1);
   };
-/*
-  // track an extra eth price to display USD for Optimism?
-  const ethprice = useExchangePrice({
-    name: "ethereum",
-    color: "#ceb0fa",
-    chainId: 1,
-    price: "uniswap",
-    rpcUrl: `https://mainnet.infura.io/v3/${INFURA_ID}`,
-    blockExplorer: "https://etherscan.io/",
-  }, mainnetProvider);
-  console.log("ethprice",ethprice)*/
 
   /* 💵 This hook will get the price of ETH from 🦄 Uniswap: */
   const price = useExchangePrice(targetNetwork, mainnetProvider);
 
   /* 🔥 This hook will get the price of Gas from ⛽️ EtherGasStation */
-  const gasPrice = useGasPrice(targetNetwork, "fast");
+  const gasPrice = useGasPrice(targetNetwork, "fast", localProvider);
   // Use your injected provider from 🦊 Metamask or if you don't have it then instantly generate a 🔥 burner wallet.
   const userProvider = useUserProvider(injectedProvider, localProvider);
   const address = useUserAddress(userProvider);
@@ -223,361 +245,190 @@ function App(props) {
 
   const balance = yourLocalBalance && formatEther(yourLocalBalance);
 
-  // if you don't have any money, scan the other networks for money
-  // lol this poller is a bad idea why does it keep
-  /*usePoller(() => {
-    if (!cachedNetwork) {
-      if (balance == 0) {
-        checkBalances(address);
-      }
+  const [showHistory, setShowHistory] = useLocalStorage("showHistory", true);
+
+  const [moneriumClient, setMoneriumClient] = useState(getNewMoneriumClient());
+  const [moneriumConnected, setMoneriumConnected] = useState(false);
+  const [moneriumClientData, setMoneriumClientData] = useState(null);
+  const [punkConnectedToMonerium, setPunkConnectedToMonerium] = useState(false);
+  const [moneriumOrders, setMoneriumOrders] = useState(null);
+  const [moneriumRadio, setMoneriumRadio] = useLocalStorage("moneriumRadio", ON_CHAIN_IBAN_VALUE);
+  const [moneriumTargetChain, setMoneriumTargetChain] = useLocalStorage(
+    networkName + "MoneriumTargetChain",
+    getAvailableTargetChainNames(networkName)[0],
+  );
+  const [moneriumTargetAddress, setMoneriumTargetAddress] = useState(address);
+  useEffect(() => {
+    setMoneriumTargetAddress(prevAddress => (prevAddress == address ? prevAddress : address));
+  }, [address]);
+
+  const memoizedMonerium = useMemo(
+    () => (
+      <Monerium
+        moneriumClient={moneriumClient}
+        setMoneriumClient={setMoneriumClient}
+        moneriumConnected={moneriumConnected}
+        setMoneriumConnected={setMoneriumConnected}
+        clientData={moneriumClientData}
+        setClientData={setMoneriumClientData}
+        punkConnectedToMonerium={punkConnectedToMonerium}
+        setPunkConnectedToMonerium={setPunkConnectedToMonerium}
+        currentPunkAddress={address}
+      />
+    ),
+    [moneriumClient, moneriumConnected, moneriumClientData, punkConnectedToMonerium, address],
+  );
+
+  const initMoneriumOrders = async sleepMs => {
+    if (sleepMs) {
+      await new Promise(r => setTimeout(r, sleepMs));
     }
-  }, 7777);*/
 
-  const connectWallet = (sessionDetails)=>{
-    console.log(" 📡 Connecting to Wallet Connect....",sessionDetails)
+    const filterObject = {
+      address: address,
+    };
 
-    let connector;
     try {
-      connector = new WalletConnect(sessionDetails);
-      const { peerMeta } = connector;
-      if (peerMeta) {
-        setWalletConnectPeerMeta(peerMeta);
-      }
+      const moneriumOrders = await getFilteredOrders(moneriumClient, filterObject);
+      setMoneriumOrders(moneriumOrders);
+    } catch (error) {
+      console.log("Something went wrong", error);
     }
-    catch(error) {
-      console.error("Coudn't connect to", sessionDetails, error);
-      localStorage.removeItem("walletConnectUrl");
+  };
+
+  useEffect(() => {
+    if (!moneriumConnected || !punkConnectedToMonerium || !address) {
       return;
     }
 
-    setWallectConnectConnector(connector)
+    initMoneriumOrders();
+  }, [moneriumClient, moneriumConnected, punkConnectedToMonerium, address]);
 
-    // Subscribe to session requests
-    connector.on("session_request", (error, payload) => {
-      if (error) {
-        throw error;
-      }
+  useEffect(() => {
+    if (!moneriumOrders) {
+      return;
+    }
 
-      console.log("SESSION REQUEST")
-      // Handle Session Request
+    let pendingOrder = false;
 
-      connector.approveSession({
-        accounts: [                 // required
-          address
-        ],
-        chainId: targetNetwork.chainId               // required
-      })
-
-      setWalletConnectConnected(true)
-      setWallectConnectConnectorSession(connector.session)
-      const { peerMeta } = payload.params[0];
-      if (peerMeta) {
-        setWalletConnectPeerMeta(peerMeta);
-      }
-
-      /* payload:
-      {
-        id: 1,
-        jsonrpc: '2.0'.
-        method: 'session_request',
-        params: [{
-          peerId: '15d8b6a3-15bd-493e-9358-111e3a4e6ee4',
-          peerMeta: {
-            name: "WalletConnect Example",
-            description: "Try out WalletConnect v1.0",
-            icons: ["https://example.walletconnect.org/favicon.ico"],
-            url: "https://example.walletconnect.org"
-          }
-        }]
-      }
-      */
-    });
-
-    // Subscribe to call requests
-    connector.on("call_request", async (error, payload) => {
-      if (error) {
-        throw error;
-      }
-
-      console.log("REQUEST PERMISSION TO:",payload,payload.params[0])
-      // Handle Call Request
-      //console.log("SETTING TO",payload.params[0].to)
-
-      //setWalletConnectTx(true)
-
-      //setToAddress(payload.params[0].to)
-      //setData(payload.params[0].data?payload.params[0].data:"0x0000")
-
-      //let bigNumber = ethers.BigNumber.from(payload.params[0].value)
-      //console.log("bigNumber",bigNumber)
-
-      //let newAmount = ethers.utils.formatEther(bigNumber)
-      //console.log("newAmount",newAmount)
-      //if(props.price){
-      //  newAmount = newAmount.div(props.price)
-      //}
-      //setAmount(newAmount)
-
-      /* payload:
-      {
-        id: 1,
-        jsonrpc: '2.0'.
-        method: 'eth_sign',
-        params: [
-          "0xbc28ea04101f03ea7a94c1379bc3ab32e65e62d3",
-          "My email is john@doe.com - 1537836206101"
-        ]
-      }
-      */
-
-      //setWalletModalData({payload:payload,connector: connector})
-
-      // https://github.com/WalletConnect/walletconnect-test-wallet/blob/7b209c10f02014ed5644fc9991de94f9d96dcf9d/src/engines/ethereum.ts#L45-L104
-      let title;
-
-      switch (payload.method) {
-        case "eth_sendTransaction":
-          title = "Send Transaction?";
-          break;
-        case "eth_signTransaction":
-          title = "Sign Transaction?";
-          break;
-        case "eth_sign":
-        case "personal_sign":
-          title = "Sign Message?";
-          break;
-        case "eth_signTypedData":
-          title = "Sign Typed Data?";
-          break;
-        default:
-          title = "Unknown method";
-          break;
-      }
-
-      confirm({
-          width: "90%",
-          size: "large",
-          title: title,
-          icon: <SendOutlined/>,
-          content: <WalletConnectTransactionDisplay payload={payload} provider={mainnetProvider} chainId={targetNetwork.chainId} />,
-          onOk:async ()=>{
-            let result;
-
-            if (payload.method === 'eth_sendTransaction') {
-              try {
-                let signer = userProvider.getSigner();
-
-                // I'm not sure if all the Dapps send an array or not
-                let params = payload.params;
-                if (Array.isArray(params)) {
-                  params = params[0];
-                }
-
-                // Ethers uses gasLimit instead of gas
-                let gasLimit = params.gas;
-                params.gasLimit = gasLimit;
-                delete params.gas;
-
-                // Speed up transaction list is filtered by chainId
-                if (!params.chainId) {
-                  params.chainId = targetNetwork.chainId;  
-                }
-
-                // Remove empty data
-                // I assume wallet connect adds "data" here: https://github.com/WalletConnect/walletconnect-monorepo/blob/7573fa9e1d91588d4af3409159b4fd2f9448a0e2/packages/helpers/utils/src/ethereum.ts#L78
-                // And ethers cannot hexlify this: https://github.com/ethers-io/ethers.js/blob/8b62aeff9cce44cbd16ff41f8fc01ebb101f8265/packages/providers/src.ts/json-rpc-provider.ts#L694
-                if (params.data === "") {
-                  delete params.data;  
-                }
-
-                result = await signer.sendTransaction(params);
-
-                const transactionManager = new TransactionManager(userProvider, signer, true);
-                transactionManager.setTransactionResponse(result);
-              }
-              catch (error) {
-                // Fallback to original code without the speed up option
-                console.error("Coudn't create transaction which can be speed up", error);
-                result = await userProvider.send(payload.method, payload.params)
-              }
-            }
-            else {
-              result = await userProvider.send(payload.method, payload.params)
-            }
-
-            //console.log("MSG:",ethers.utils.toUtf8Bytes(msg).toString())
-
-            //console.log("payload.params[0]:",payload.params[1])
-            //console.log("address:",address)
-
-            //let userSigner = userProvider.getSigner()
-            //let result = await userSigner.signMessage(msg)
-            console.log("RESULT:",result)
-
-            let wcRecult = result.hash ? result.hash : (result.raw ? result.raw : result)
-
-            connector.approveRequest({
-              id: payload.id,
-              result: wcRecult
-            });
-
-            notification.info({
-              message: "Wallet Connect Transaction Sent",
-              description: wcRecult,
-              placement: "bottomRight",
-            });
-          },
-          onCancel: ()=>{
-            console.log('Cancel');
-            connector.rejectRequest({
-              id: payload.id,
-              error: { message:"User rejected" },
-            });
-          },
-        });
-      //setIsWalletModalVisible(true)
-      //if(payload.method == "personal_sign"){
-      //  console.log("SIGNING A MESSAGE!!!")
-        //const msg = payload.params[0]
-      //}
-    });
-
-    connector.on("disconnect", (error, payload) => {
-      if (error) {
-        throw error;
-      }
-      console.log("disconnect")
-
-      localStorage.removeItem("walletConnectUrl")
-      localStorage.removeItem("wallectConnectConnectorSession")
-
-      setTimeout(() => {
-        window.location.reload();
-      }, 1);
-
-      // Delete connector
-    });
-  }
-
-  const [ walletConnectUrl, setWalletConnectUrl ] = useLocalStorage("walletConnectUrl")
-  const [ walletConnectConnected, setWalletConnectConnected ] = useState()
-  const [ walletConnectPeerMeta, setWalletConnectPeerMeta ] = useState()
-
-  const [ wallectConnectConnector, setWallectConnectConnector ] = useState()
-  //store the connector session in local storage so sessions persist through page loads ( thanks Pedro <3 )
-  const [ wallectConnectConnectorSession, setWallectConnectConnectorSession ] = useLocalStorage("wallectConnectConnectorSession")
-
-  useEffect(()=>{
-    if (wallectConnectConnector && wallectConnectConnector.connected && address && localChainId) {
-      const connectedAccounts = wallectConnectConnector?.accounts;
-      let connectedAddress;
-
-      if (connectedAccounts) {
-        connectedAddress = connectedAccounts[0];
-      }
-
-      // Use Checksummed addresses
-      if (connectedAddress && (ethers.utils.getAddress(connectedAddress) != ethers.utils.getAddress(address))) {
-        console.log("Updating wallet connect session with the new address");
-        console.log("Connected address", ethers.utils.getAddress(connectedAddress));
-        console.log("New address ", ethers.utils.getAddress(address));
-
-        updateWalletConnectSession(wallectConnectConnector, address, localChainId);
-      }
-
-      const connectedChainId = wallectConnectConnector?.chainId;
-
-      if (connectedChainId && (connectedChainId != localChainId)) {
-        console.log("Updating wallet connect session with the new chainId");
-        console.log("Connected chainId", connectedChainId);
-        console.log("New chainId ", localChainId);
-
-        updateWalletConnectSession(wallectConnectConnector, address, localChainId);
+    for (const order of moneriumOrders) {
+      const state = order?.meta?.state;
+      if ((state && state == OrderState.placed) || state == OrderState.pending) {
+        console.log("There is a pending order", order);
+        pendingOrder = true;
+        break;
       }
     }
-  },[ address, localChainId ]);
 
-  const updateWalletConnectSession = (wallectConnectConnector, address, chainId) => {
-    wallectConnectConnector.updateSession({
-      accounts: [address],
-      chainId: localChainId,
-    });
-  }
+    if (pendingOrder) {
+      initMoneriumOrders(3000);
+    }
+  }, [moneriumOrders]);
 
-  useEffect(()=>{
-    if(!walletConnectConnected && address){
-      let nextSession = localStorage.getItem("wallectConnectNextSession")
-      if(nextSession){
-        localStorage.removeItem("wallectConnectNextSession")
-        console.log("FOUND A NEXT SESSION IN CACHE")
-        setWalletConnectUrl(nextSession)
-      }else if(wallectConnectConnectorSession){
-        console.log("NOT CONNECTED AND wallectConnectConnectorSession",wallectConnectConnectorSession)
-        connectWallet( wallectConnectConnectorSession )
-        setWalletConnectConnected(true)
-      }else if(walletConnectUrl/*&&!walletConnectUrlSaved*/){
-        //CLEAR LOCAL STORAGE?!?
-        console.log("clear local storage and connect...")
-        localStorage.removeItem("walletconnect") // lololol
-        connectWallet(      {
-                // Required
-                uri: walletConnectUrl,
-                // Required
-                clientMeta: {
-                  description: "Forkable web wallet for small/quick transactions.",
-                  url: "https://punkwallet.io",
-                  icons: ["https://punkwallet.io/punk.png"],
-                  name: "🧑‍🎤 PunkWallet.io",
-                },
-              }/*,
-              {
-                // Optional
-                url: "<YOUR_PUSH_SERVER_URL>",
-                type: "fcm",
-                token: token,
-                peerMeta: true,
-                language: language,
-              }*/)
+  const [ibanAddressObject, setIbanAddressObject] = useState({});
+
+  const isMoneriumDataLoading =
+    moneriumConnected && !moneriumClientData && selectedErc20Token && selectedErc20Token.name == "EURe";
+  const isMoneriumTransferReady =
+    moneriumConnected && punkConnectedToMonerium && selectedErc20Token && selectedErc20Token.name == "EURe";
+
+  const [walletConnectUrl, setWalletConnectUrl] = useLocalStorage("walletConnectUrl");
+
+  const [web3wallet, setWeb3wallet] = useState();
+
+  // Wallet Connect V2 initialization and listeners
+  useEffect(() => {
+    if (!address) {
+      return;
+    }
+
+    async function initWeb3wallet() {
+      const web3wallet = await createWeb3wallet();
+
+      web3wallet.on("session_proposal", proposal => {
+        onSessionProposal(web3wallet, address, proposal);
+      });
+
+      web3wallet.on("session_request", async requestEvent => {
+        console.log("session_request requestEvent", requestEvent);
+
+        WalletConnectTransactionPopUp(requestEvent, userProvider, web3wallet, targetNetwork.chainId);
+      });
+
+      web3wallet.on("session_update", async event => {
+        console.log("session_update event", event);
+      });
+
+      web3wallet.on("session_delete", async event => {
+        console.log("session_delete event", event);
+      });
+
+      web3wallet.on("session_event", async event => {
+        console.log("session_event", event);
+      });
+
+      web3wallet.on("session_ping", async event => {
+        console.log("session_ping", event);
+      });
+
+      web3wallet.on("session_expire", async event => {
+        console.log("session_expire", event);
+      });
+
+      web3wallet.on("session_extend", async event => {
+        console.log("session_extend", event);
+      });
+
+      web3wallet.on("proposal_expire", async event => {
+        console.log("proposal_expire", event);
+      });
+
+      setWeb3wallet(web3wallet);
+    }
+
+    initWeb3wallet();
+  }, [address]);
+
+  useEffect(() => {
+    async function pairWalletConnectV2() {
+      if (walletConnectUrl && walletConnectUrl.includes("@2") && web3wallet) {
+        console.log(" 📡 Connecting to Wallet Connect V2....", walletConnectUrl);
+
+        try {
+          await web3wallet.core.pairing.pair({ uri: walletConnectUrl });
+        } catch (error) {
+          console.log("Cannot create pairing", error);
+          WalletConnectV2ConnectionError(error, undefined);
+        }
+
+        setWalletConnectUrl("");
       }
     }
-  },[ walletConnectUrl, address ])
+
+    pairWalletConnectV2();
+  }, [walletConnectUrl, web3wallet]);
+
+  // Forcing white background for the QR code - Dark Reader issue
+  useEffect(() => {
+    setTimeout(() => {
+      const element = document.getElementById("QRPunkBlockieDiv");
+      if (element) {
+        element.removeAttribute("data-darkreader-inline-bgcolor");
+      }
+    }, 50);
+  }, []);
 
   useMemo(() => {
     if (address && window.location.pathname) {
       if (window.location.pathname.indexOf("/wc") >= 0) {
-        console.log("WALLET CONNECT!!!!!",window.location.search)
-        let uri = window.location.search.replace("?uri=","")
-        console.log("WC URI:",uri)
-        setWalletConnectUrl(decodeURIComponent(uri))
+        console.log("WALLET CONNECT!!!!!", window.location.search);
+        let uri = window.location.search.replace("?uri=", "");
+        console.log("WC URI:", uri);
+        setWalletConnectUrl(decodeURIComponent(uri));
+        window.history.pushState({}, "", "/");
       }
     }
   }, [injectedProvider, localProvider, address]);
-
-
-  /*
-  setTimeout(()=>{
-    if(!cachedNetwork){
-      if(balance==0){
-        checkBalances(address)
-      }
-    }
-  },1777)
-  setTimeout(()=>{
-    if(!cachedNetwork){
-      if(balance==0){
-        checkBalances(address)
-      }
-    }
-  },3777)
-*/
-
-  // Just plug in different 🛰 providers to get your balance on different chains:
-  const yourMainnetBalance = useBalance(mainnetProvider, address);
-
-  /*
-  const addressFromENS = useResolveName(mainnetProvider, "austingriffith.eth");
-  console.log("🏷 Resolved austingriffith.eth as:",addressFromENS)
-  */
 
   //
   // 🧫 DEBUG 👨🏻‍🔬
@@ -630,13 +481,13 @@ function App(props) {
                 You have <b>{networkSelected && networkSelected.name}</b> selected and you need to be on{" "}
                 <b>{networkLocal && networkLocal.name}</b>.
                 <Button
-                  style={{marginTop:4}}
+                  style={{ marginTop: 4 }}
                   onClick={async () => {
                     const ethereum = window.ethereum;
                     const data = [
                       {
                         chainId: "0x" + targetNetwork.chainId.toString(16),
-                        chainName: targetNetwork.name,
+                        chainName: networkName,
                         nativeCurrency: targetNetwork.nativeCurrency,
                         rpcUrls: [targetNetwork.rpcUrl],
                         blockExplorerUrls: [targetNetwork.blockExplorer],
@@ -647,36 +498,33 @@ function App(props) {
                     let switchTx;
 
                     try {
-                      console.log("first trying to add...")
+                      console.log("first trying to add...");
                       switchTx = await ethereum.request({
                         method: "wallet_addEthereumChain",
                         params: data,
                       });
                     } catch (addError) {
                       // handle "add" error
-                      console.log("error adding, trying to switch")
+                      console.log("error adding, trying to switch");
                       try {
-                        console.log("Trying a switch...")
+                        console.log("Trying a switch...");
                         switchTx = await ethereum.request({
                           method: "wallet_switchEthereumChain",
                           params: [{ chainId: data[0].chainId }],
                         });
                       } catch (switchError) {
                         // not checking specific error code, because maybe we're not using MetaMask
-
                       }
                     }
                     // https://docs.metamask.io/guide/rpc-api.html#other-rpc-methods
-
 
                     if (switchTx) {
                       console.log(switchTx);
                     }
                   }}
                 >
-                  <span style={{paddingRight:4}}>switch to</span>  <b>{NETWORK(localChainId).name}</b>
+                  <span style={{ paddingRight: 4 }}>switch to</span> <b>{NETWORK(localChainId).name}</b>
                 </Button>
-
               </div>
             }
             type="error"
@@ -685,48 +533,14 @@ function App(props) {
         </div>
       );
     }
-  } else {
-    networkDisplay = (
-      <div style={{ zIndex: -1, position: "absolute", right: 154, top: 28, padding: 16, color: targetNetwork.color }}>
-        {targetNetwork.name}
-      </div>
-    );
   }
-
-  const options = [];
-  for (const id in NETWORKS) {
-    options.push(
-      <Select.Option key={id} value={NETWORKS[id].name}>
-        <span style={{ color: NETWORKS[id].color, fontSize: 24 }}>{NETWORKS[id].name}</span>
-      </Select.Option>,
-    );
-  }
-
-  const networkSelect = (
-    <Select
-      size="large"
-      defaultValue={targetNetwork.name}
-      style={{ textAlign: "left", width: 170, fontSize: 30 }}
-      listHeight={1024}
-      onChange={value => {
-        if (targetNetwork.chainId != NETWORKS[value].chainId) {
-          window.localStorage.setItem("network", value);
-          setTimeout(() => {
-            window.location.reload();
-          }, 1);
-        }
-      }}
-    >
-      {options}
-    </Select>
-  );
 
   const loadWeb3Modal = useCallback(async () => {
     const provider = await web3Modal.connect();
-    provider.on("disconnect",()=>{
-      console.log("LOGOUT!")
-      logoutOfWeb3Modal()
-    })
+    provider.on("disconnect", () => {
+      console.log("LOGOUT!");
+      logoutOfWeb3Modal();
+    });
     setInjectedProvider(new Web3Provider(provider));
   }, [setInjectedProvider]);
 
@@ -736,13 +550,8 @@ function App(props) {
     }
   }, [loadWeb3Modal]);
 
-  const [route, setRoute] = useState();
-  useEffect(() => {
-    setRoute(window.location.pathname);
-  }, [setRoute]);
-
   let faucetHint = "";
-  const faucetAvailable = localProvider && localProvider.connection && targetNetwork.name == "localhost";
+  const faucetAvailable = localProvider && localProvider.connection && networkName == "localhost";
 
   const [faucetClicked, setFaucetClicked] = useState(false);
   if (
@@ -771,31 +580,168 @@ function App(props) {
     );
   }
 
-  let startingAddress = "";
-  if (window.location.pathname) {
-    const incoming = window.location.pathname.replace("/", "");
-    if (incoming && ethers.utils.isAddress(incoming)) {
-      startingAddress = incoming;
-      window.history.pushState({}, "", "/");
+  const [toAddress, setToAddress] = useLocalStorage("punkWalletToAddress", "", 120000);
+
+  const [amount, setAmount] = useState();
+
+  const [amountEthMode, setAmountEthMode] = useState(false);
+
+  const [receiveMode, setReceiveMode] = useState(false);
+
+  // ERC20 Token balance to use in ERC20Balance and in ERC20Input
+  const [balanceERC20, setBalanceERC20] = useState(null);
+
+  const [priceERC20, setPriceERC20] = useState();
+
+  const switchToTokenAddress = localStorage.getItem("switchToTokenAddress");
+
+  if (switchToTokenAddress) {
+    localStorage.removeItem("switchToTokenAddress");
+    const storedAmount = localStorage.getItem("amount");
+    if (storedAmount) {
+      localStorage.removeItem("amount");
     }
 
-    /* let rawPK
-    if(incomingPK.length===64||incomingPK.length===66){
-      console.log("🔑 Incoming Private Key...");
-      rawPK=incomingPK
-      burnerConfig.privateKey = rawPK
-      window.history.pushState({},"", "/");
-      let currentPrivateKey = window.localStorage.getItem("metaPrivateKey");
-      if(currentPrivateKey && currentPrivateKey!==rawPK){
-        window.localStorage.setItem("metaPrivateKey_backup"+Date.now(),currentPrivateKey);
+    let tokens = targetNetwork?.erc20Tokens;
+
+    if (tokens) {
+      const customTokens = tokenSettingsHelper.getCustomItems();
+
+      if (customTokens.length > 0) {
+        tokens = tokens.concat(customTokens);
       }
-      window.localStorage.setItem("metaPrivateKey",rawPK);
-    } */
+
+      const token = tokens.find(token => token.address.toLowerCase() === switchToTokenAddress.toLowerCase());
+
+      if (token) {
+        setPriceERC20(null);
+
+        if (selectedErc20Token?.address.toLowerCase() !== switchToTokenAddress.toLowerCase()) {
+          tokenSettingsHelper.updateSelectedName(token.name);
+        }
+
+        if (storedAmount) {
+          const amountBigNumber = BigNumber.from(storedAmount);
+          setAmount(amountBigNumber);
+        }
+      } else {
+        showModal(TOKEN_ERROR.NOT_SUPPORTED + " :" + switchToTokenAddress);
+      }
+    }
   }
-  // console.log("startingAddress",startingAddress)
-  const [amount, setAmount] = useState();
+
+  const storedAmount = localStorage.getItem("amount");
+
+  if (storedAmount) {
+    localStorage.removeItem("amount");
+
+    const amountBigNumber = BigNumber.from(storedAmount);
+    setAmount(amountBigNumber);
+  }
+
+  if (window.location.pathname !== "/") {
+    try {
+      const path = window.location.pathname.replace("/", "");
+
+      if (path.startsWith("ethereum:")) {
+        const eip681URL = window.location.href.substring(window.location.href.indexOf("ethereum:"));
+
+        parseEIP618(eip681URL, networkSettingsHelper, setTargetNetwork, setToAddress, setAmount);
+
+        window.history.pushState({}, "", "/");
+      }
+    } catch (error) {
+      console.log("Coudn't parse EIP681", error);
+    }
+  }
+
+  if (window.location.pathname !== "/") {
+    try {
+      const incoming = window.location.pathname.replace("/", "");
+
+      if (incoming) {
+        const incomingParts = incoming.split(":");
+
+        let index = 0;
+        let pushState = false;
+
+        const incomingNetworkName = incomingParts[index];
+        let incomingNetwork;
+
+        if (incomingNetworkName) {
+          incomingNetwork = Object.values(NETWORKS).find(network => network.name.startsWith(incomingNetworkName));
+
+          if (incomingNetwork) {
+            console.log("incoming network:", incomingNetwork);
+
+            networkSettingsHelper.updateSelectedName(incomingNetwork.name);
+            setTargetNetwork(networkSettingsHelper.getSelectedItem(true));
+
+            let pushStateURL = "/";
+
+            if (incomingParts.length > 1 && incomingParts[1] == "pk") {
+              pushStateURL = "pk" + window.location.hash;
+            }
+
+            window.history.pushState({}, "", pushStateURL);
+            pushState = true;
+
+            index++;
+          }
+        }
+
+        let validAddress = false;
+
+        if (incomingParts.length > index) {
+          const incomingAddress = incomingParts[index];
+
+          if (incomingAddress && ethers.utils.isAddress(incomingAddress)) {
+            console.log("incoming address:", incomingAddress);
+
+            validAddress = true;
+
+            setToAddress(incomingAddress);
+
+            if (!pushState) {
+              window.history.pushState({}, "", "/");
+              pushState = true;
+            }
+          }
+
+          index++;
+        }
+
+        if (validAddress && incomingParts.length > index) {
+          const incomingAmount = parseFloat(incomingParts[index]);
+
+          if (incomingAmount > 0) {
+            console.log("incoming amount:", incomingAmount);
+            setAmount(incomingAmount);
+            setAmountEthMode(true);
+
+            if (!incomingNetwork) {
+              if (targetNetwork?.nativeToken?.name) {
+                tokenSettingsHelper.updateSelectedName(targetNetwork.nativeToken.name);
+                console.log("Switched to native token");
+              }
+            }
+
+            if (incomingNetwork?.nativeToken) {
+              localStorage.setItem("switchToEth", true);
+            }
+          }
+
+          if (!pushState) {
+            window.history.pushState({}, "", "/");
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Coudn't parse incoming address/amount/network", error);
+    }
+  }
+
   const [data, setData] = useState();
-  const [toAddress, setToAddress] = useLocalStorage("punkWalletToAddress", startingAddress, 120000);
 
   const [walletConnectTx, setWalletConnectTx] = useState();
 
@@ -803,40 +749,6 @@ function App(props) {
 
   const [depositing, setDepositing] = useState();
   const [depositAmount, setDepositAmount] = useState();
-
-/*
-  const handleOk = async () => {
-    setIsWalletModalVisible(false);
-
-    let result = await userProvider.send(walletModalData.payload.method, walletModalData.payload.params)
-
-    //console.log("MSG:",ethers.utils.toUtf8Bytes(msg).toString())
-
-    //console.log("payload.params[0]:",payload.params[1])
-    //console.log("address:",address)
-
-    //let userSigner = userProvider.getSigner()
-    //let result = await userSigner.signMessage(msg)
-    console.log("RESULT:",result)
-
-
-    walletModalData.connector.approveRequest({
-      id: walletModalData.payload.id,
-      result: result
-    });
-
-    notification.info({
-      message: "Wallet Connect Transaction Sent",
-      description: result.hash,
-      placement: "bottomRight",
-    });
-  };
-
-  const handleCancel = () => {
-    setIsWalletModalVisible(false);
-  };
-
-*/
 
   const walletDisplay =
     web3Modal && web3Modal.cachedProvider ? (
@@ -847,10 +759,78 @@ function App(props) {
 
   return (
     <div className="App">
+      {networkSettingsHelper && (
+        <SettingsModal
+          settingsHelper={networkSettingsHelper}
+          itemCoreDisplay={network => <NetworkDisplay network={network} />}
+          itemDetailedDisplay={(
+            networkSettingsHelper,
+            networkDetailed,
+            networkCoreDisplay,
+            network,
+            setItemDetailed,
+            setTargetNetwork,
+          ) => (
+            <NetworkDetailedDisplay
+              networkSettingsHelper={networkSettingsHelper}
+              network={networkDetailed}
+              networkCoreDisplay={networkCoreDisplay}
+              setTargetNetwork={setTargetNetwork}
+              currentPunkAddress={address}
+            />
+          )}
+          modalOpen={networkSettingsModalOpen}
+          setModalOpen={setNetworkSettingsModalOpen}
+          title={"Network Settings"}
+          setTargetNetwork={setTargetNetwork}
+        />
+      )}
+
+      {tokenSettingsHelper && (
+        <SettingsModal
+          settingsHelper={tokenSettingsHelper}
+          itemCoreDisplay={token => (
+            <TokenDisplay
+              token={token}
+              divStyle={{ display: "flex", alignItems: "center", justifyContent: "center" }}
+              spanStyle={{ paddingLeft: "0.2em" }}
+            />
+          )}
+          itemDetailedDisplay={(tokenSettingsHelper, tokenDetailed, tokenCoreDisplay, network, setItemDetailed) => (
+            <TokenDetailedDisplay
+              tokenSettingsHelper={tokenSettingsHelper}
+              token={tokenDetailed}
+              tokenCoreDisplay={tokenCoreDisplay}
+              network={network}
+              setItemDetailed={setItemDetailed}
+            />
+          )}
+          itemImportDisplay={(tokenSettingsHelper, tokenCoreDisplay, tokenDetailedDisplay, network, setImportView) => (
+            <TokenImportDisplay
+              tokenSettingsHelper={tokenSettingsHelper}
+              tokenCoreDisplay={tokenCoreDisplay}
+              tokenDetailedDisplay={tokenDetailedDisplay}
+              network={network}
+              setImportView={setImportView}
+            />
+          )}
+          modalOpen={tokenSettingsModalOpen}
+          setModalOpen={setTokenSettingsModalOpen}
+          title={"Token Settings"} // ToDo: Reuse TOKEN_SETTINGS_STORAGE_KEY and colored network name
+          network={targetNetwork}
+        />
+      )}
+
       <div className="site-page-header-ghost-wrapper">
         <Header
           extra={[
-            <Address key="address" fontSize={32} address={address} ensProvider={mainnetProvider} blockExplorer={blockExplorer} />,
+            <Address
+              key="address"
+              fontSize={32}
+              address={address}
+              ensProvider={mainnetProvider}
+              blockExplorer={blockExplorer}
+            />,
             /* <span style={{ verticalAlign: "middle", paddingLeft: 16, fontSize: 32 }}>
               <Tooltip title="History">
                 <HistoryOutlined onClick={async () => {
@@ -860,7 +840,13 @@ function App(props) {
             </span>, */
             walletDisplay,
 
-            <span key="checkBalances" style={{color: "#1890ff",cursor:"pointer",fontSize:30,opacity:checkingBalances?0.2:1,paddingLeft:16,verticalAlign:"middle"}} onClick={()=>{checkBalances(address)}}><ReloadOutlined /></span>,
+            <Reload
+              key="checkBalances"
+              currentPunkAddress={address}
+              localProvider={localProvider}
+              networkSettingsHelper={networkSettingsHelper}
+              setTargetNetwork={setTargetNetwork}
+            />,
             <Account
               key="account"
               address={address}
@@ -879,381 +865,430 @@ function App(props) {
 
       {/* ✏️ Edit the header and change the title to your project name */}
 
-      <div style={{ clear: "both", opacity: yourLocalBalance ? 1 : 0.2, width: 500, margin: "auto",position:"relative" }}>
-        <Balance value={yourLocalBalance} size={12+window.innerWidth/16} price={price} />
+      <div
+        style={{ clear: "both", opacity: yourLocalBalance ? 1 : 0.2, width: 500, margin: "auto", position: "relative" }}
+      >
+        <div>
+          {selectedErc20Token ? (
+            <ERC20Balance
+              targetNetwork={targetNetwork}
+              token={selectedErc20Token}
+              rpcURL={targetNetwork.rpcUrl}
+              size={12 + window.innerWidth / 16}
+              address={address}
+              dollarMode={dollarMode}
+              setDollarMode={setDollarMode}
+              balance={balanceERC20}
+              setBalance={setBalanceERC20}
+              setPrice={setPriceERC20}
+              price={priceERC20}
+            />
+          ) : (
+            <Balance
+              value={yourLocalBalance}
+              size={12 + window.innerWidth / 16}
+              price={price}
+              dollarMode={dollarMode}
+              setDollarMode={setDollarMode}
+            />
+          )}
+        </div>
+
         <span style={{ verticalAlign: "middle" }}>
-          {networkSelect}
+          <div
+            style={{ display: "flex", justifyContent: erc20Tokens ? "space-evenly" : "center", alignItems: "center" }}
+          >
+            <div>
+              <SelectorWithSettings
+                settingsHelper={networkSettingsHelper}
+                settingsModalOpen={setNetworkSettingsModalOpen}
+                itemCoreDisplay={network => <NetworkDisplay network={network} />}
+                onChange={value => {
+                  setTargetNetwork(networkSettingsHelper.getSelectedItem(true));
+                }}
+                optionStyle={{ lineHeight: 1.1 }}
+              />
+            </div>
+            <div>
+              {" "}
+              {tokenSettingsHelper && (
+                <SelectorWithSettings
+                  settingsHelper={tokenSettingsHelper}
+                  settingsModalOpen={setTokenSettingsModalOpen}
+                  itemCoreDisplay={token => <TokenDisplay token={token} />}
+                />
+              )}
+            </div>
+          </div>
           {faucetHint}
         </span>
       </div>
 
-      {
-        address && 
-        <div style={{ padding: 16, cursor: "pointer", backgroundColor: "#FFFFFF", width: 420, margin: "auto" }}>
-          <QRPunkBlockie withQr address={address} showAddress={true} /> 
-        </div>
-      }
-
-      <div style={{ position: "relative", width: 320, margin: "auto", textAlign: "center", marginTop: 32 }}>
-        <div style={{ padding: 10 }}>
-          <AddressInput
-            ensProvider={mainnetProvider}
-            placeholder="to address"
-            disabled={walletConnectTx}
-            value={toAddress}
-            onChange={setToAddress}
-            hoistScanner={toggle => {
-              scanner = toggle;
-            }}
-            walletConnect={(wcLink)=>{
-              //if(walletConnectUrl){
-                /*try{
-                  //setWalletConnectConnected(false);
-                  //setWalletConnectUrl();
-                  //if(wallectConnectConnector) wallectConnectConnector.killSession();
-                  //if(wallectConnectConnectorSession) setWallectConnectConnectorSession("");
-                  setWalletConnectConnected(false);
-                  //if(wallectConnectConnector) wallectConnectConnector.killSession();
-                  localStorage.removeItem("walletConnectUrl")
-                  localStorage.removeItem("wallectConnectConnectorSession")
-                }catch(e){console.log(e)}
-              }
-
-              setTimeout(()=>{
-                window.location.replace('/wc?uri='+wcLink);
-              },500)*/
-
-              if(walletConnectUrl){
-                //existing session... need to kill it and then connect new one....
-                setWalletConnectConnected(false);
-                if(wallectConnectConnector) wallectConnectConnector.killSession();
-                localStorage.removeItem("walletConnectUrl")
-                localStorage.removeItem("wallectConnectConnectorSession")
-                localStorage.setItem("wallectConnectNextSession",wcLink)
-              }else{
-                setWalletConnectUrl(wcLink)
-              }
-
-            }}
+      {address && (
+        <div
+          id="QRPunkBlockieDiv"
+          style={{ padding: 16, cursor: "pointer", backgroundColor: "#FFFFFF", width: 420, margin: "auto" }}
+        >
+          <QRPunkBlockie
+            address={address}
+            showAddress={true}
+            withQr
+            receiveMode={receiveMode}
+            chainId={targetNetwork.chainId}
+            amount={amount}
+            selectedErc20Token={selectedErc20Token}
           />
         </div>
+      )}
 
+      <div
+        style={{
+          position: "relative",
+          width: 320,
+          margin: "auto",
+          textAlign: "center",
+          marginTop: 32,
+          backgroundColor: "",
+        }}
+      >
         <div style={{ padding: 10 }}>
-          {walletConnectTx ? <Input disabled={true} value={amount}/>:<EtherInput
-            price={price || targetNetwork.price}
-            value={amount}
-            token={targetNetwork.token || "ETH"}
-            onChange={value => {
-              setAmount(value);
-            }}
-          />}
-
+          {isMoneriumDataLoading && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                marginTop: -25,
+                paddingBottom: 25,
+              }}
+            >
+              <img
+                src={"/MoneriumLogo.png"}
+                alt={"Monerium Data loading"}
+                style={{
+                  width: "2em",
+                  height: "2em",
+                }}
+              />
+              <Spin />
+            </div>
+          )}
+          {!receiveMode && (
+            <>
+              {isMoneriumTransferReady && (
+                <MoneriumOnChainCrossChainRadio moneriumRadio={moneriumRadio} setMoneriumRadio={setMoneriumRadio} />
+              )}
+              {isMoneriumTransferReady && isCrossChain(moneriumRadio) ? (
+                <MoneriumCrossChainAddressSelector
+                  clientData={moneriumClientData}
+                  currentPunkAddress={address}
+                  targetChain={moneriumTargetChain}
+                  setTargetChain={setMoneriumTargetChain}
+                  targetAddress={moneriumTargetAddress}
+                  setTargetAddress={setMoneriumTargetAddress}
+                  networkName={targetNetwork.name}
+                />
+              ) : (
+                <AddressInput
+                  key={receiveMode}
+                  ensProvider={mainnetProvider}
+                  placeholder={isMoneriumTransferReady ? "to address / IBAN" : "to address"}
+                  disabled={walletConnectTx}
+                  value={toAddress}
+                  setAmount={setAmount}
+                  setToAddress={setToAddress}
+                  hoistScanner={toggle => {
+                    scanner = toggle;
+                  }}
+                  isMoneriumTransferReady={isMoneriumTransferReady}
+                  ibanAddressObject={ibanAddressObject}
+                  setIbanAddressObject={setIbanAddressObject}
+                  networkSettingsHelper={networkSettingsHelper}
+                  setTargetNetwork={setTargetNetwork}
+                  walletConnect={wcLink => {
+                    setWalletConnectUrl(wcLink);
+                  }}
+                />
+              )}
+            </>
+          )}
         </div>
-        {/*
+
+        <div style={{ padding: !receiveMode ? 10 : 0 }}>
+          {walletConnectTx ? (
+            <Input disabled={true} value={amount} />
+          ) : selectedErc20Token ? (
+            <ERC20Input
+              token={selectedErc20Token}
+              value={amount}
+              amount={amount}
+              setAmount={setAmount}
+              balance={balanceERC20}
+              price={priceERC20}
+              setPrice={setPriceERC20}
+              dollarMode={dollarMode}
+              setDollarMode={setDollarMode}
+              receiveMode={receiveMode}
+            />
+          ) : (
+            <EtherInput
+              price={price || targetNetwork.price}
+              value={amount}
+              token={targetNetwork.token || "ETH"}
+              ethMode={amountEthMode}
+              address={address}
+              provider={localProvider}
+              gasPrice={gasPrice}
+              onChange={value => {
+                setAmount(value);
+              }}
+              receiveMode={receiveMode}
+              amount={amount}
+              selectedErc20Token={selectedErc20Token}
+              targetNetwork={targetNetwork}
+            />
+          )}
+        </div>
+
+        <div style={{ position: "relative", top: 10, left: 40 }}> {networkDisplay} </div>
+
+        {!receiveMode && (
           <div style={{ padding: 10 }}>
-          <Input
-          placeholder="data (0x0000)"
-          value={data}
-          disabled={walletConnectTx}
-          onChange={(e)=>{
-            setData(e.target.value)
-          }}
-          />
+            <Button
+              key={receiveMode}
+              type="primary"
+              disabled={
+                loading ||
+                !amount ||
+                (!toAddress && !(isMoneriumTransferReady && isCrossChain(moneriumRadio))) ||
+                (isValidIban(toAddress) && !isIbanAddressObjectValid(ibanAddressObject))
+              }
+              loading={loading}
+              onClick={async () => {
+                setLoading(true);
+
+                if (isMoneriumTransferReady && isCrossChain(moneriumRadio)) {
+                  const order = await placeCrossChainOrder(
+                    moneriumClient,
+                    address,
+                    { targetChainName: moneriumTargetChain, address: moneriumTargetAddress },
+                    amount,
+                    networkName,
+                  );
+                  await initMoneriumOrders();
+                } else if (isValidIban(toAddress)) {
+                  const order = await placeIbanOrder(moneriumClient, address, ibanAddressObject, amount, networkName);
+                  await initMoneriumOrders();
+                } else {
+                  let txConfig = {
+                    chainId: selectedChainId,
+                  };
+
+                  if (!selectedErc20Token) {
+                    let value;
+                    try {
+                      console.log("PARSE ETHER", amount);
+                      value = parseEther("" + amount);
+                      console.log("PARSEDVALUE", value);
+                    } catch (e) {
+                      const floatVal = parseFloat(amount).toFixed(8);
+
+                      console.log("floatVal", floatVal);
+                      // failed to parseEther, try something else
+                      value = parseEther("" + floatVal);
+                      console.log("PARSEDfloatVALUE", value);
+                    }
+
+                    txConfig.to = toAddress;
+                    txConfig.value = value;
+                  } else {
+                    if (selectedErc20Token) {
+                      txConfig.erc20 = {
+                        token: selectedErc20Token,
+                        to: toAddress,
+                        amount: amount,
+                      };
+                    }
+                  }
+
+                  if (networkName == "arbitrum") {
+                    //txConfig.gasLimit = 21000;
+                    //ask rpc for gas price
+                  } else if (networkName == "optimism") {
+                    //ask rpc for gas price
+                  } else if (networkName == "gnosis") {
+                    //ask rpc for gas price
+                  } else if (networkName == "polygon") {
+                    //ask rpc for gas price
+                  } else if (networkName == "goerli") {
+                    //ask rpc for gas price
+                  } else if (networkName == "base") {
+                    //ask rpc for gas price
+                  } else if (networkName == "sepolia") {
+                    //ask rpc for gas price
+                  } else {
+                    txConfig.gasPrice = gasPrice;
+                  }
+
+                  console.log("SEND AND NETWORK", targetNetwork);
+
+                  let result = tx(txConfig);
+                  result = await result;
+                  console.log(result);
+                }
+
+                // setToAddress("")
+                setAmount("");
+                setData("");
+
+                setShowHistory(true);
+                setLoading(false);
+
+                monitorBalance(selectedErc20Token, targetNetwork.rpcUrl, address, balanceERC20, setBalanceERC20);
+              }}
+            >
+              {loading ||
+              !amount ||
+              (!toAddress && !(isMoneriumTransferReady && isCrossChain(moneriumRadio))) ||
+              (isValidIban(toAddress) && !isIbanAddressObjectValid(ibanAddressObject)) ? (
+                <CaretUpOutlined />
+              ) : (
+                <SendOutlined style={{ color: "#FFFFFF" }} />
+              )}{" "}
+              Send
+            </Button>
           </div>
-          */}
-        <div style={{ position: "relative", top: 10, left:40 }}> {networkDisplay} </div>
-        <div style={{ padding: 10 }}>
-          <Button
-            key="submit"
-            type="primary"
-            disabled={loading || !amount || !toAddress}
-            loading={loading}
-            onClick={async () => {
-              setLoading(true);
-
-              let value;
-              try {
-
-                console.log("PARSE ETHER",amount)
-                value = parseEther("" + amount);
-                console.log("PARSEDVALUE",value)
-              } catch (e) {
-                const floatVal = parseFloat(amount).toFixed(8);
-
-                console.log("floatVal",floatVal)
-                // failed to parseEther, try something else
-                value = parseEther("" + floatVal);
-                console.log("PARSEDfloatVALUE",value)
-              }
-
-              let txConfig = {
-                to: toAddress,
-                chainId: selectedChainId,
-                value,
-              }
-
-              if(targetNetwork.name=="arbitrum"){
-                //txConfig.gasLimit = 21000;
-                //ask rpc for gas price
-              }else if(targetNetwork.name=="optimism"){
-                //ask rpc for gas price
-              }else if(targetNetwork.name=="gnosis"){
-                //ask rpc for gas price
-              }else if(targetNetwork.name=="polygon"){
-                  //ask rpc for gas price
-              }else{
-                txConfig.gasPrice = gasPrice
-              }
-
-              console.log("SEND AND NETWORK",targetNetwork)
-              let result = tx(txConfig);
-              // setToAddress("")
-              setAmount("");
-              setData("");
-              result = await result;
-              console.log(result);
-              setLoading(false);
-            }}
-          >
-            {loading || !amount || !toAddress ? <CaretUpOutlined /> : <SendOutlined style={{ color: "#FFFFFF" }} />}{" "}
-            Send
-          </Button>
-        </div>
+        )}
       </div>
 
-      {/* <BrowserRouter>
-
-        <Menu style={{ textAlign:"center" }} selectedKeys={[route]} mode="horizontal">
-          <Menu.Item key="/">
-            <Link
-              onClick={() => {
-                setRoute("/");
-              }}
-              to="/"
-            >
-              YourContract
-            </Link>
-          </Menu.Item>
-          <Menu.Item key="/hints">
-            <Link
-              onClick={() => {
-                setRoute("/hints");
-              }}
-              to="/hints"
-            >
-              Hints
-            </Link>
-          </Menu.Item>
-          <Menu.Item key="/exampleui">
-            <Link
-              onClick={() => {
-                setRoute("/exampleui");
-              }}
-              to="/exampleui"
-            >
-              ExampleUI
-            </Link>
-          </Menu.Item>
-          <Menu.Item key="/mainnetdai">
-            <Link
-              onClick={() => {
-                setRoute("/mainnetdai");
-              }}
-              to="/mainnetdai"
-            >
-              Mainnet DAI
-            </Link>
-          </Menu.Item>
-          <Menu.Item key="/subgraph">
-            <Link
-              onClick={() => {
-                setRoute("/subgraph");
-              }}
-              to="/subgraph"
-            >
-              Subgraph
-            </Link>
-          </Menu.Item>
-        </Menu>
-        <Switch>
-          <Route exact path="/">
-            }
-            <Contract
-              name="YourContract"
-              signer={userProvider.getSigner()}
-              provider={localProvider}
-              address={address}
-              blockExplorer={blockExplorer}
-            />
-
-
-
-          </Route>
-          <Route path="/hints">
-            <Hints
-              address={address}
-              yourLocalBalance={yourLocalBalance}
-              mainnetProvider={mainnetProvider}
-              price={price}
-            />
-          </Route>
-          <Route path="/exampleui">
-            <ExampleUI
-              address={address}
-              userProvider={userProvider}
-              mainnetProvider={mainnetProvider}
-              localProvider={localProvider}
-              yourLocalBalance={yourLocalBalance}
-              price={price}
-              tx={tx}
-              writeContracts={writeContracts}
-              readContracts={readContracts}
-              purpose={purpose}
-              setPurposeEvents={setPurposeEvents}
-            />
-          </Route>
-          <Route path="/mainnetdai">
-            <Contract
-              name="DAI"
-              customContract={mainnetDAIContract}
-              signer={userProvider.getSigner()}
-              provider={mainnetProvider}
-              address={address}
-              blockExplorer="https://etherscan.io/"
-            />
-          </Route>
-          <Route path="/subgraph">
-            <Subgraph
-              subgraphUri={props.subgraphUri}
-              tx={tx}
-              writeContracts={writeContracts}
-              mainnetProvider={mainnetProvider}
-            />
-          </Route>
-        </Switch>
-      </BrowserRouter>
-*/}
-
       <div style={{ padding: 16, backgroundColor: "#FFFFFF", width: 420, margin: "auto" }}>
+        {
           <TransactionResponses
-             provider={userProvider}
-             signer={userProvider.getSigner()}
-             injectedProvider={injectedProvider}
-             address={address} 
-             chainId={targetNetwork.chainId}
-             blockExplorer={blockExplorer}
-           />
+            provider={userProvider}
+            signer={userProvider.getSigner()}
+            injectedProvider={injectedProvider}
+            address={address}
+            chainId={targetNetwork.chainId}
+            blockExplorer={blockExplorer}
+            moneriumOrders={moneriumOrders}
+            showHistory={showHistory}
+            setShowHistory={setShowHistory}
+          />
+        }
+      </div>
+
+      <div style={{ padding: "1em" }}>
+        <Switch
+          checkedChildren="Send"
+          unCheckedChildren="Receive"
+          defaultChecked
+          onChange={() => setReceiveMode(!receiveMode)}
+        />
       </div>
 
       <div style={{ zIndex: -1, paddingTop: 20, opacity: 0.5, fontSize: 12 }}>
         <Button
-          style={{ margin:8, marginTop: 16 }}
+          style={{ margin: 8, marginTop: 16 }}
           onClick={() => {
-            window.open("https://zapper.fi/account/"+address+"?tab=history");
+            window.open("https://zapper.fi/account/" + address + "?tab=history");
           }}
         >
           <span style={{ marginRight: 8 }}>📜</span>History
         </Button>
 
         <Button
-          style={{  margin:8, marginTop: 16, }}
+          style={{ margin: 8, marginTop: 16 }}
           onClick={() => {
-            window.open("https://zapper.fi/account/"+address);
+            window.open("https://zapper.fi/account/" + address);
           }}
         >
           <span style={{ marginRight: 8 }}>👛</span> Inventory
         </Button>
-
-
-
       </div>
 
-      <div style={{ clear: "both", width: 500, margin: "auto" ,marginTop:32, position:"relative"}}>
-        {(wallectConnectConnector && !wallectConnectConnector.connected) && 
+      <div style={{ clear: "both", maxWidth: "100%", width: 975, margin: "auto", marginTop: 32, position: "relative" }}>
+        {web3wallet && <WalletConnectActiveSessions web3wallet={web3wallet} />}
 
-          <div>
-            <Spin />
-            <div>
-               Connecting to the Dapp...
-            </div>   
-          </div>}
-        {walletConnectConnected ?
-          <>
-            {(walletConnectPeerMeta?.icons[0]) ? 
-              <span >
-              {walletConnectPeerMeta?.icons[0] && <img style={{width: 40, top:-4, position:"absolute",left:26}} src={walletConnectPeerMeta.icons[0]} alt={walletConnectPeerMeta.name ? walletConnectPeerMeta.name : ""} />}
-              </span>
-              :
-              <span style={{cursor:"pointer",padding:8,fontSize:30,position:"absolute",top:-16,left:28}}>✅</span>
-            }
-          </>
-          :""
-        }
-        <Input
-          style={{width:"70%"}}
-          placeholder={"wallet connect url (or use the scanner-->)"}
-          value={walletConnectUrl}
-          disabled={walletConnectConnected}
-          onChange={(e)=>{
-            setWalletConnectUrl(e.target.value)
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            paddingBottom: "1em",
           }}
-        />{walletConnectConnected?<span style={{cursor:"pointer",padding:10,fontSize:30,position:"absolute", top:-18}} onClick={()=>{
-          setWalletConnectConnected(false);
-          if(wallectConnectConnector) wallectConnectConnector.killSession();
-          localStorage.removeItem("walletConnectUrl")
-          localStorage.removeItem("wallectConnectConnectorSession")
-        }}>🗑</span>:""}
+        >
+          <Input
+            style={{ width: "40%", textAlign: "center" }}
+            placeholder={"wallet connect url (or use the scanner-->)"}
+            value={""}
+            onChange={e => {
+              setWalletConnectUrl(e.target.value);
+            }}
+          />
+        </div>
+
+        <IFrame address={address} userProvider={userProvider} />
+
+        <div style={{ paddingTop: "2em" }}>{memoizedMonerium}</div>
       </div>
 
-
-      { targetNetwork.name=="ethereum" ? <div style={{ zIndex: -1, padding: 64, opacity: 0.5, fontSize: 12 }}>
-        {
-          depositing ? <div style={{width:200,margin:"auto"}}>
-            <EtherInput
-              /*price={price || targetNetwork.price}*/
-              value={depositAmount}
-              token={targetNetwork.token || "ETH"}
-              onChange={value => {
-                setDepositAmount(value);
-              }}
-            />
-            <Button
-              style={{ margin:8, marginTop: 16 }}
-              onClick={() => {
-                console.log("DEPOSITING",depositAmount)
-                tx({
-                  to: "0x99C9fc46f92E8a1c0deC1b1747d010903E884bE1",
-                  value: ethers.utils.parseEther(depositAmount),
-                  gasLimit: 175000,
-                  gasPrice: gasPrice,
-                  data: "0xb1a1a882000000000000000000000000000000000000000000000000000000000013d62000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000000"
-                })
-                setDepositAmount()
-                setDepositing()
-              }}
-            >
-              <span style={{ marginRight: 8 }}>🔴</span>Deposit
-            </Button>
-          </div>:<div>
-            <Button
-              style={{ margin:8, marginTop: 16 }}
-              onClick={() => {
-                setDepositing(true)
-                /*tx({
+      {networkName == "ethereum" ? (
+        <div style={{ zIndex: -1, padding: 64, opacity: 0.5, fontSize: 12 }}>
+          {depositing ? (
+            <div style={{ width: 200, margin: "auto" }}>
+              <EtherInput
+                /*price={price || targetNetwork.price}*/
+                value={depositAmount}
+                token={targetNetwork.token || "ETH"}
+                // address={address}
+                // provider={localProvider}
+                // gasPrice={gasPrice}
+                onChange={value => {
+                  setDepositAmount(value);
+                }}
+              />
+              <Button
+                style={{ margin: 8, marginTop: 16 }}
+                onClick={() => {
+                  console.log("DEPOSITING", depositAmount);
+                  tx({
+                    to: "0x99C9fc46f92E8a1c0deC1b1747d010903E884bE1",
+                    value: ethers.utils.parseEther(depositAmount),
+                    gasLimit: 175000,
+                    gasPrice: gasPrice,
+                    data:
+                      "0xb1a1a882000000000000000000000000000000000000000000000000000000000013d62000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000000",
+                  });
+                  setDepositAmount();
+                  setDepositing();
+                }}
+              >
+                <span style={{ marginRight: 8 }}>🔴</span>Deposit
+              </Button>
+            </div>
+          ) : (
+            <div>
+              <Button
+                style={{ margin: 8, marginTop: 16 }}
+                onClick={() => {
+                  setDepositing(true);
+                  /*tx({
                   to: "0x99C9fc46f92E8a1c0deC1b1747d010903E884bE1",
                   value: ethers.utils.parseEther("0.01"),
                   gasLimit: 175000,
                   gasPrice: gasPrice,
                   data: "0xb1a1a882000000000000000000000000000000000000000000000000000000000013d62000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000000"
                 })*/
-              }}
-            >
-              <span style={{ marginRight: 8 }}>🔴</span>Deposit to OE
-            </Button>
-          </div>
-        }
-      </div> : ""}
-
+                }}
+              >
+                <span style={{ marginRight: 8 }}>🔴</span>Deposit to OE
+              </Button>
+            </div>
+          )}
+        </div>
+      ) : (
+        ""
+      )}
 
       <div style={{ zIndex: -1, padding: 64, opacity: 0.5, fontSize: 12 }}>
         created with <span style={{ marginRight: 4 }}>🏗</span>
@@ -1277,7 +1312,7 @@ function App(props) {
         <Button
           type="primary"
           shape="circle"
-          style={{backgroundColor:targetNetwork.color,borderColor:targetNetwork.color}}
+          style={{ backgroundColor: targetNetwork.color, borderColor: targetNetwork.color }}
           size="large"
           onClick={() => {
             scanner(true);
@@ -1287,16 +1322,6 @@ function App(props) {
         </Button>
       </div>
 
-{/*
-
-      <Modal title={walletModalData && walletModalData.payload && walletModalData.payload.method} visible={isWalletModalVisible} onOk={handleOk} onCancel={handleCancel}>
-       <pre>
-        {walletModalData && walletModalData.payload && JSON.stringify(walletModalData.payload.params, null, 2)}
-       </pre>
-     </Modal>
-  */}
-
-
       {/* 🗺 Extra UI like gas price, eth price, faucet, and support: */}
       <div style={{ position: "fixed", textAlign: "left", left: 0, bottom: 20, padding: 10 }}>
         <Row align="middle" gutter={[16, 16]}>
@@ -1304,9 +1329,16 @@ function App(props) {
             <Ramp price={price} address={address} networks={NETWORKS} />
           </Col>
 
-          {targetNetwork.name=="arbitrum"||targetNetwork.name=="gnosis"||targetNetwork.name=="optimism"||targetNetwork.name=="polygon"?"":<Col span={12} style={{ textAlign: "center", opacity: 0.8 }}>
-            <GasGauge gasPrice={gasPrice} />
-          </Col>}
+          {networkName == "arbitrum" ||
+          networkName == "gnosis" ||
+          networkName == "optimism" ||
+          networkName == "polygon" ? (
+            ""
+          ) : (
+            <Col span={12} style={{ textAlign: "center", opacity: 0.8 }}>
+              <GasGauge gasPrice={gasPrice} />
+            </Col>
+          )}
         </Row>
 
         <Row align="middle" gutter={[4, 4]}>

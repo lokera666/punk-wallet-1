@@ -1,111 +1,142 @@
-import React, { useState, useEffect } from "react";
-import QR from 'qrcode.react';
-import { Blockie, Balance } from "."
-import { message, Typography } from 'antd';
-const { Text } = Typography;
+import React from "react";
+import QR from "qrcode.react";
+import { message } from "antd";
+import { build } from "eth-url-parser";
 
+import { Punk, PunkBlockie } from ".";
 
-export default function QRPunkBlockie(props) {
+import { copy } from "../helpers/EditorHelper";
 
-  const size = useWindowSize();
-  const minSize = 360
-  let qrWidth
-  if(size.width / 3 < minSize) {
-    qrWidth = minSize
-  } else {
-    qrWidth = size.width / 3
+const { ethers } = require("ethers");
+
+export const BLOCKIES_DEFAULT_SIZE = 8;
+
+export default function QRPunkBlockie({
+  address,
+  showAddress,
+  withQr,
+  receiveMode,
+  scale,
+  chainId,
+  amount,
+  selectedErc20Token,
+}) {
+  let displayValue = address;
+  let paymentLink;
+
+  if (receiveMode) {
+    try {
+      const eip681Data = {
+        scheme: "ethereum",
+        prefix: null,
+        target_address: selectedErc20Token ? selectedErc20Token.address : address,
+        chain_id: chainId,
+        function_name: selectedErc20Token ? "transfer" : null,
+        parameters: {},
+      };
+
+      if (selectedErc20Token) {
+        eip681Data.parameters.address = address;
+      }
+
+      if (amount) {
+        let amountString;
+
+        try {
+          const decimals = selectedErc20Token ? selectedErc20Token.decimals : 18;
+
+          amountString = ethers.utils
+            .parseUnits(typeof amount === "string" ? amount : amount.toFixed(decimals).toString(), decimals)
+            .toString();
+        } catch (error) {
+          console.error("Couldn't parse amount", amount, error);
+        }
+
+        if (amountString) {
+          if (selectedErc20Token) {
+            eip681Data.parameters.uint256 = amountString;
+          } else {
+            eip681Data.parameters.value = amountString;
+          }
+        }
+      }
+
+      const eip681 = build(eip681Data);
+
+      displayValue = eip681;
+
+      paymentLink = window.location.href + displayValue;
+    } catch (error) {
+      console.error("Couldn't create EIP-681 QR value", error);
+    }
   }
 
-  let scale = Math.min(size.height-130,size.width,1024)/(qrWidth*1)
+  const hardcodedSizeForNow = 380;
+  let blockieScale = 11.5;
 
-  let offset =  0.42
+  if (scale) {
+    blockieScale *= scale;
+  }
 
-  const url  = window.location.href+""
-
-  const hardcodedSizeForNow = 380
-
-  const punkSize = 112
-
-  let part1 = props.address && props.address.substr(2,20)
-  let part2= props.address && props.address.substr(22)
-  const x = parseInt(part1, 16)%100
-  const y = parseInt(part2, 16)%100
-
-  //console.log("window.location",window.location)
+  const punkSize = blockieScale * BLOCKIES_DEFAULT_SIZE; // Make punk image the same size as the blockie, from https://github.com/ethereum/blockies: width/height of the icon in blocks, default: 8
 
   return (
-    <div style={{transform:"scale("+(props.scale?props.scale:"1")+")",transformOrigin:"50% 50%",margin:"auto", position:"relative",width:hardcodedSizeForNow}} onClick={()=>{
-       const el = document.createElement('textarea');
-       el.value = props.address;
-       document.body.appendChild(el);
-       el.select();
-       document.execCommand('copy');
-       document.body.removeChild(el);
-       const iconHardcodedSizeForNow = 380
-       const iconPunkSize = 40
-       message.success(
-         <span style={{position:"relative"}}>
-          Copied Address
-          <div style={{position:"absolute",left:-60,top:-14}}>
-            <div style={{position:"relative",width:iconPunkSize, height:iconPunkSize-1, overflow: "hidden"}}>
-              <img src="/punks.png" style={{position:"absolute",left:-iconPunkSize*x,top:(-iconPunkSize*y),width:iconPunkSize*100, height:iconPunkSize*100,imageRendering:"pixelated"}} />
-            </div>
+    <span
+      onClick={() =>
+        copy(paymentLink || displayValue, () =>
+          message.success(
+            <span style={{ position: "relative" }}>
+              {!receiveMode ? "Copied Address" : "Copied Payment Link"}
+              <div style={{ position: "absolute", left: -60, top: -14, zIndex: 1 }}>
+                <Punk address={address} size={40} />
+              </div>
+            </span>,
+          ),
+        )
+      }
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          width: hardcodedSizeForNow,
+          margin: "auto",
+          position: "",
+        }}
+      >
+        {withQr && (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <QR
+              level="H"
+              includeMargin={false}
+              value={displayValue}
+              size={hardcodedSizeForNow}
+              imageSettings={{ width: 105, height: 105, excavate: true, src: "" }}
+            />
           </div>
-         </span>
-       );
-    }}>
+        )}
 
-      <div style={{position:"absolute",opacity:0.5,left:hardcodedSizeForNow/2-46,top:hardcodedSizeForNow/2-46}}>
-        <Blockie address={props.address} scale={11.5}/>
-      </div>
-
-      <div style={{position:"absolute",left:hardcodedSizeForNow/2-53,top:hardcodedSizeForNow/2-65}}>
-        <div style={{position:"relative",width:punkSize, height:punkSize-1, overflow: "hidden"}}>
-          <img src="/punks.png" style={{position:"absolute",left:-punkSize*x,top:(-punkSize*y)-1,width:punkSize*100, height:punkSize*100,imageRendering:"pixelated"}} />
+        <div style={{ position: "absolute" }}>
+          <PunkBlockie address={address} size={punkSize} />
         </div>
       </div>
 
-      {props.withQr ? <QR
-        level={"H"}
-        includeMargin={false}
-        //ethereum:0x34aA3F359A9D614239015126635CE7732c18fDF3
-        value={props.address?props.address:""}//"https://punkwallet.io/"+
-        size={hardcodedSizeForNow}
-        imageSettings={{width:105,height:105,excavate:true,src:""}}
-      /> : ""}
-
-
-      {props.showAddress ? <div style={{fontWeight:"bolder",letterSpacing:-0.8,color:"#666666",fontSize:14.8}}>{props.address}</div>: ""}
-
-    </div>
+      {showAddress && (
+        <div
+          style={{
+            overflowWrap: "break-word",
+            wordWrap: "break-word",
+            marginTop: "0.39em",
+            fontWeight: "bolder",
+            letterSpacing: -0.8,
+            color: "#666666",
+            fontSize: 14.8,
+          }}
+        >
+          {displayValue}
+        </div>
+      )}
+    </span>
   );
-}
-
-
-function useWindowSize() {
-  const isClient = typeof window === 'object';
-
-  function getSize() {
-    return {
-      width: isClient ? window.innerWidth : undefined,
-      height: isClient ? window.innerHeight : undefined
-    };
-  }
-
-  const [windowSize, setWindowSize] = useState(getSize);
-
-  useEffect(() => {
-    if (!isClient) {
-      return false;
-    }
-
-    function handleResize() {
-      setWindowSize(getSize());
-    }
-
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, []); // Empty array ensures that effect is only run on mount and unmount
-
-  return windowSize;
 }

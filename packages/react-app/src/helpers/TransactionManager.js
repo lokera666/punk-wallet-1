@@ -1,7 +1,10 @@
+import { NETWORKS } from "../constants";
+import { getChainIdNumber, getEthersWallet } from "./EIP1559Helper";
+
 const { BigNumber, ethers } = require("ethers");
 
 const STORAGE_KEY = "transactionResponses";
-const LOCAL_STORAGE_CHANGED_EVENT_NAME = "localStorageChanged";
+export const LOCAL_STORAGE_CHANGED_EVENT_NAME = "localStorageChanged";
 
 export class TransactionManager {
 	constructor(provider, signer, loggingEnabled) {
@@ -69,6 +72,14 @@ export class TransactionManager {
 	}
 	async updateTransactionResponse(transactionResponse) {
 		let newTransactionResponse = await this.provider.getTransaction(transactionResponse.hash);
+
+		if (newTransactionResponse && transactionResponse?.erc20) {
+			newTransactionResponse.erc20 = transactionResponse.erc20;
+		}
+
+		if (newTransactionResponse && transactionResponse?.origin) {
+			newTransactionResponse.origin = transactionResponse.origin;
+		}
 
 		this.setTransactionResponse(newTransactionResponse ? newTransactionResponse : transactionResponse);
 	}
@@ -148,30 +159,42 @@ export class TransactionManager {
 		return !(confirmations > 0);
 	}
 
-	cancelTransaction(key) {
-		let transactionParams = this.getSpeedUpTransactionParams(key, 10);
-
-		transactionParams.to = transactionParams.from;
-		transactionParams.data = "0x";
-		transactionParams.value = "0x";
-		this.log("transactionParams", transactionParams);
-
-		return this.signer.sendTransaction(transactionParams);
-	}
-	
-	speedUpTransaction(key, speedUpPercentage) {
-		if (!speedUpPercentage) {
-			speedUpPercentage = 10;
-		}
-
+	async cancelTransaction(key, speedUpPercentage = 10) {
 		let transactionParams = this.getSpeedUpTransactionParams(key, speedUpPercentage);
-		this.log("transactionParams", transactionParams);
 
 		if (!transactionParams) {
 			return;
 		}
 
-		return this.signer.sendTransaction(transactionParams);
+		transactionParams.to = transactionParams.from;
+		transactionParams.value = 0x00;
+		delete transactionParams.data;
+
+		return await this.sendUpdatedTransaction(transactionParams);
+	}
+	
+	async speedUpTransaction(key, speedUpPercentage = 10) {
+		let transactionParams = this.getSpeedUpTransactionParams(key, speedUpPercentage);
+
+		return await this.sendUpdatedTransaction(transactionParams);
+	}
+
+	async sendUpdatedTransaction (transactionParams) {
+		this.log("updated transactionParams", transactionParams);
+
+		if (!transactionParams) {
+			return;
+		}
+
+		const chainId = getChainIdNumber(transactionParams);
+
+		if ((chainId == NETWORKS.ethereum.chainId) || (chainId == NETWORKS.polygon.chainId)) {
+			const ethersWallet = getEthersWallet(transactionParams);
+			return await ethersWallet.sendTransaction(transactionParams);
+		}
+		else {
+			return await this.signer.sendTransaction(transactionParams);	
+		}
 	}
 
 	getSpeedUpTransactionParams(key, speedUpPercentage) {
